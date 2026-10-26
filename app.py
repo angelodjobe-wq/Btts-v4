@@ -196,7 +196,7 @@ if st.button("🔍 Analyser BTTS"):
             st.write(f"P(Home marque)={a['calc']['p_home']*100:.1f}% | P(Away marque)={a['calc']['p_away']*100:.1f}% | Hist BTTS moyen={a['calc']['avg_btts']*100:.1f}%")
             with st.expander("Voir détails stats et limites"):
                 st.json({"home": a["home_stats"], "away": a["away_stats"], "calc": a["calc"]})
-                st.write("Données manquantes: seulement 10 derniers matchs, pas de compos, blessures, motivation. Estimation garantie.")
+                st.write("Données manquantes: seulement 10 derniers matchs, pas de compos, blessures, motivation. Estimation pas garantie.")
     
     st.divider()
     st.write("Tous les matchs analysés")
