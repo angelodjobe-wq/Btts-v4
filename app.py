@@ -6,7 +6,7 @@ import streamlit as st
 
 st.set_page_config(page_title="BTTS V4 - Analyse", layout="wide")
 st.title("BTTS V4 - Analyse")
-st.caption("Version avec moteur BTTS - Estimation, aucune garantie")
+st.caption("Version avec moteur BTTS - Estimation,  garantie")
 
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
