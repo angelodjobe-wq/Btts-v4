@@ -2,49 +2,63 @@ import os
 import streamlit as st
 import requests
 from datetime import datetime
+import pytz
 
-st.set_page_config(page_title="BTTS V5.2", layout="wide", page_icon="⚽")
+st.set_page_config(page_title="ANGELO V7 AUTO", layout="wide", page_icon="⚽")
 
-API_KEY = os.getenv("API_FOOTBALL_KEY") or os.getenv("API_KEY") or ""
+API_KEY = os.getenv("API_FOOTBALL_KEY") or ""
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
-
-if not API_KEY:
-    st.error("🔴 Clé API manquante")
-    st.stop()
 
 def api_call(endpoint, params):
     try:
         r = requests.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=15)
-        data = r.json()
-        if "errors" in data and data["errors"]:
-            if "suspended" in str(data["errors"]).lower():
-                st.error("🔴 Compte API-Football suspendu")
-                st.stop()
-        return data
-    except Exception as e:
-        st.error(f"Erreur API: {e}")
+        return r.json()
+    except:
         return None
 
-st.title("⚽ ANGELO V5.2 - MOTEUR TOTAL")
-st.caption("Moteur d'Analyse Statistique | BTTS • BUTS • CORNERS")
+# DATE AUTO ABIDJAN - ÇA MONTE TOUT SEUL CHAQUE JOUR
+tz_abidjan = pytz.timezone("Africa/Abidjan")
+today = datetime.now(tz_abidjan)
+date_str = today.strftime("%Y-%m-%d")
+
+st.title("⚽ ANGELO V7 - AUTO DAILY")
+st.caption(f"Matchs du Jour Auto | {today.strftime('%d.%m.%Y')} Abidjan | Ça monte chaque jour")
 st.divider()
 
-st.subheader("📅 Matchs du Jour (Abidjan)")
-date_str = datetime.now().strftime("%Y-%m-%d")
+# On récupère TOUS les matchs du jour auto
 fixtures_data = api_call("fixtures", {"date": date_str, "timezone": "Africa/Abidjan"})
 
 if not fixtures_data or not fixtures_data.get("response"):
-    st.warning("Aucun match aujourd'hui.")
+    st.warning(f"Aucun match le {date_str} ou API en pause")
     st.stop()
 
 fixtures = fixtures_data["response"]
+# Tri par heure - ça monte dans l'ordre
+fixtures = sorted(fixtures, key=lambda x: x['fixture']['date'])
+
+# On garde seulement les matchs à venir (pas finis)
+fixtures_upcoming = [f for f in fixtures if f['fixture']['status']['short'] in ["NS", "TBD"]]
+
+st.subheader(f"📅 {len(fixtures_upcoming)} Matchs Aujourd'hui - {date_str}")
+st.caption("La liste se met à jour automatiquement chaque jour à 00h00 Abidjan")
+
+# Recherche rapide
+search = st.text_input("🔍 Cherche une équipe (ex: Roma, Lazio)", "")
+if search:
+    fixtures_upcoming = [f for f in fixtures_upcoming if search.lower() in f['teams']['home']['name'].lower() or search.lower() in f['teams']['away']['name'].lower()]
+
 fixture_options = {}
-for f in fixtures:
-    key = f"{f['fixture']['id']} - {f['teams']['home']['name']} vs {f['teams']['away']['name']}"
+for f in fixtures_upcoming:
+    heure = f['fixture']['date'][11:16]
+    key = f"{heure} - {f['teams']['home']['name']} vs {f['teams']['away']['name']} ({f['league']['name']})"
     fixture_options[key] = f
 
-selected_label = st.selectbox("Choisis un match :", list(fixture_options.keys()))
+if not fixture_options:
+    st.info("Aucun match avec ce nom")
+    st.stop()
+
+selected_label = st.selectbox(f"Choisis un match ({len(fixture_options)} dispo) :", list(fixture_options.keys()))
 selected_fixture = fixture_options[selected_label]
 
 home_id = selected_fixture['teams']['home']['id']
@@ -61,40 +75,39 @@ def get_team_stats(team_id, league_id):
     return None
 
 if st.button("🚀 LANCER ANALYSE", type="primary", use_container_width=True):
-    with st.spinner("Calcul..."):
-        home_stats = get_team_stats(home_id, league_id)
-        away_stats = get_team_stats(away_id, league_id)
-        if not home_stats or not away_stats:
-            st.warning("Stats non dispo, choisis Top 5 championnats.")
+    with st.spinner("Analyse..."):
+        hs = get_team_stats(home_id, league_id)
+        aws = get_team_stats(away_id, league_id)
+        if not hs or not aws:
+            st.warning("Stats non dispo pour cette petite ligue")
             st.stop()
-        home_goals_avg = float(home_stats['goals']['for']['average']['total'] or 1.2)
-        away_goals_avg = float(away_stats['goals']['for']['average']['total'] or 1.2)
-        home_conceded_avg = float(home_stats['goals']['against']['average']['total'] or 1.1)
-        away_conceded_avg = float(away_stats['goals']['against']['average']['total'] or 1.1)
-        btts_score = 0
-        if home_goals_avg >= 1.2: btts_score += 20
-        if away_goals_avg >= 1.2: btts_score += 20
-        if home_conceded_avg >= 0.9: btts_score += 15
-        if away_conceded_avg >= 0.9: btts_score += 15
-        if home_stats['clean_sheet']['total'] < 8: btts_score += 15
-        if away_stats['clean_sheet']['total'] < 8: btts_score += 15
-        btts_score = min(btts_score, 95)
-        total_attack = home_goals_avg + away_goals_avg + home_conceded_avg + away_conceded_avg
-        over25_score = int((total_attack / 3.2) * 100)
-        over25_score = min(max(over25_score, 25), 90)
-        corner_score = int(total_attack * 2.2 + 2)
-        corner_score = min(max(corner_score, 6), 13)
-        action_score = int((btts_score * 0.4) + (over25_score * 0.4) + (corner_score * 2))
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("BTTS", f"{btts_score}%")
-    col2.metric("OVER 2.5", f"{over25_score}%")
-    col3.metric("CORNERS", f"~{corner_score}")
-    col4.metric("ACTION", f"{action_score}/100")
-    if btts_score >= 75:
-        st.success(f"✅ BTTS FORT {btts_score}%")
-    elif btts_score >= 60:
-        st.warning(f"⚠️ BTTS MOYEN {btts_score}%")
-    else:
-        st.error(f"❌ PAS BTTS {btts_score}%")
+        hg = float(hs['goals']['for']['average']['total'] or 1.2)
+        ag = float(aws['goals']['for']['average']['total'] or 1.2)
+        hc = float(hs['goals']['against']['average']['total'] or 1.1)
+        ac = float(aws['goals']['against']['average']['total'] or 1.1)
+        btts = 0
+        if hg>=1.2: btts+=20
+        if ag>=1.2: btts+=20
+        if hc>=0.9: btts+=15
+        if ac>=0.9: btts+=15
+        if hs['clean_sheet']['total']<8: btts+=15
+        if aws['clean_sheet']['total']<8: btts+=15
+        btts=min(btts,95)
+        total = hg+ag+hc+ac
+        over25 = min(max(int((total/3.2)*100),25),90)
+        corner = min(max(int(total*2.2+2),6),13)
+        action = int((btts*0.4)+(over25*0.4)+(corner*2))
+    
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("BTTS", f"{btts}%", "FORT" if btts>=75 else "MOYEN")
+    c2.metric("OVER 2.5", f"{over25}%")
+    c3.metric("CORNERS", f"~{corner}")
+    c4.metric("ACTION", f"{action}/100")
+    
+    if btts>=75: st.success(f"✅ BTTS FORT {home_name} vs {away_name} {btts}%")
+    elif btts>=60: st.warning(f"⚠️ BTTS MOYEN {btts}%")
+    else: st.error(f"❌ PAS BTTS {btts}%")
+    
+    st.progress(btts/100)
 
-st.caption(f"Analyse {datetime.now().strftime('%H:%M')} GMT")
+st.caption(f"Auto Daily {today.strftime('%H:%M')} Abidjan | Chaque jour ça monte")
