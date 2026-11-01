@@ -1,79 +1,67 @@
 
 import os
-import time
 import math
-import json
-import threading
+import time
 import requests
 import streamlit as st
-import pandas as pd
-
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from apscheduler.schedulers.background import BackgroundScheduler
 
-# =========================================
-# BTTS V4 ULTRA ENGINE
-# =========================================
-
-TZ = ZoneInfo("Africa/Abidjan")
-BASE = "https://v3.football.api-sports.io"
-API_KEY = os.getenv("API_FOOTBALL_KEY")
-
-MIN_PROB = 80
-TOP_N = 5
-MAX_FIXTURES = 60
-
-HEADERS = {"x-apisports-key": API_KEY or ""}
+# ==========================================
+# BTTS V5 - MOTEUR AUTOMATIQUE
+# ==========================================
 
 st.set_page_config(
-    page_title="BTTS V4 ULTRA",
+    page_title="BTTS V5",
     page_icon="⚽",
     layout="wide"
 )
 
-# Shared application cache
-if "daily_results" not in st.session_state:
-    st.session_state.daily_results = None
+API_KEY = os.getenv("API_FOOTBALL_KEY")
+BASE_URL = "https://v3.football.api-sports.io"
+TZ = ZoneInfo("Africa/Abidjan")
 
-if "last_update" not in st.session_state:
-    st.session_state.last_update = None
+st.title("⚽ BTTS V5 - Football Intelligence")
+st.caption("Analyse automatique | Actualisation chaque minute")
 
-if "analysis_error" not in st.session_state:
-    st.session_state.analysis_error = None
+if not API_KEY:
+    st.error("Clé API absente : vérifie API_FOOTBALL_KEY dans Render.")
+    st.stop()
 
-# =========================================
-# API REQUESTS
-# =========================================
+HEADERS = {"x-apisports-key": API_KEY}
 
-def api_get(endpoint, params=None):
+# Réglages pour maîtriser le quota
+MAX_ANALYSES = 10
+MAX_RECOMMENDATIONS = 3
+
+
+# ==========================================
+# API FOOTBALL
+# ==========================================
+
+def api_request(endpoint, params):
     try:
         response = requests.get(
-            BASE + endpoint,
+            BASE_URL + endpoint,
             headers=HEADERS,
-            params=params or {},
+            params=params,
             timeout=25
         )
         response.raise_for_status()
-
         data = response.json()
 
         if data.get("errors"):
-            return []
+            raise RuntimeError(str(data["errors"]))
 
         return data.get("response", [])
 
     except Exception as error:
-        print("API ERROR:", error)
-        return []
+        raise RuntimeError(f"Erreur API : {error}")
 
 
-# =========================================
-# MATCHES OF THE DAY
-# =========================================
-
-def get_fixtures(date):
-    return api_get(
+@st.cache_data(ttl=60, show_spinner=False)
+def get_today_matches(date):
+    return api_request(
         "/fixtures",
         {
             "date": date,
@@ -82,468 +70,394 @@ def get_fixtures(date):
     )
 
 
-# =========================================
-# LAST 10 MATCHES
-# =========================================
-
-team_cache = {}
-
+@st.cache_data(ttl=21600, show_spinner=False)
 def get_team_history(team_id):
+    time.sleep(0.35)
 
-    if team_id in team_cache:
-        return team_cache[team_id]
-
-    matches = api_get(
+    fixtures = api_request(
         "/fixtures",
         {
             "team": team_id,
             "last": 10,
-            "status": "FT",
             "timezone": "Africa/Abidjan"
         }
     )
 
-    team_cache[team_id] = matches
+    return [
+        f for f in fixtures
+        if f.get("fixture", {}).get("status", {}).get("short")
+        in ["FT", "AET", "PEN"]
+        and f.get("goals", {}).get("home") is not None
+        and f.get("goals", {}).get("away") is not None
+    ]
 
-    time.sleep(0.25)
 
-    return matches
+# ==========================================
+# STATISTIQUES DES ÉQUIPES
+# ==========================================
 
+def extract_team_stats(fixtures, team_id):
+    result = []
 
-def analyze_team(team_id):
+    for match in fixtures:
+        teams = match["teams"]
+        goals = match["goals"]
 
-    matches = get_team_history(team_id)
+        if teams["home"]["id"] == team_id:
+            scored = goals["home"]
+            conceded = goals["away"]
+            venue = "home"
 
-    data = []
+        elif teams["away"]["id"] == team_id:
+            scored = goals["away"]
+            conceded = goals["home"]
+            venue = "away"
 
-    for match in matches:
-
-        goals = match.get("goals", {})
-        teams = match.get("teams", {})
-
-        home_goals = goals.get("home")
-        away_goals = goals.get("away")
-
-        if home_goals is None or away_goals is None:
+        else:
             continue
 
-        is_home = teams["home"]["id"] == team_id
-
-        scored = home_goals if is_home else away_goals
-        conceded = away_goals if is_home else home_goals
-
-        data.append({
+        result.append({
             "scored": scored,
             "conceded": conceded,
             "btts": int(scored > 0 and conceded > 0),
-            "home": is_home
+            "total": scored + conceded,
+            "venue": venue
         })
 
-    if len(data) < 8:
+    return result
+
+
+def average_stats(matches):
+    if len(matches) < 1:
         return None
 
-    df = pd.DataFrame(data)
+    n = len(matches)
 
     return {
-        "matches": len(df),
-        "attack": df.scored.mean(),
-        "defense": df.conceded.mean(),
-        "scored_rate": (df.scored > 0).mean(),
-        "conceded_rate": (df.conceded > 0).mean(),
-        "btts": df.btts.mean(),
-        "recent": df.head(5).btts.mean(),
-        "home_data": df[df.home],
-        "away_data": df[~df.home]
+        "count": n,
+        "scored": sum(x["scored"] for x in matches) / n,
+        "conceded": sum(x["conceded"] for x in matches) / n,
+        "btts": sum(x["btts"] for x in matches) / n,
+        "total": sum(x["total"] for x in matches) / n
     }
 
 
-# =========================================
-# POISSON MODEL
-# =========================================
+def team_profile(fixtures, team_id):
+    stats = extract_team_stats(fixtures, team_id)
 
-def probability_btts(home_goals, away_goals):
-
-    p_home = 1 - math.exp(-home_goals)
-    p_away = 1 - math.exp(-away_goals)
-
-    yes = p_home * p_away
-
-    return yes, 1 - yes
-
-
-# =========================================
-# SECOND OPINION: API-FOOTBALL
-# =========================================
-
-def get_api_prediction(fixture_id):
-
-    result = api_get(
-        "/predictions",
-        {"fixture": fixture_id}
-    )
-
-    if not result:
+    if len(stats) < 5:
         return None
 
-    return result[0].get("predictions", {})
+    last5 = average_stats(stats[:5])
+    last10 = average_stats(stats[:10])
+
+    home_stats = average_stats([
+        x for x in stats if x["venue"] == "home"
+    ])
+
+    away_stats = average_stats([
+        x for x in stats if x["venue"] == "away"
+    ])
+
+    return {
+        "last5": last5,
+        "last10": last10,
+        "home": home_stats,
+        "away": away_stats
+    }
 
 
-# =========================================
-# ADVANCED MATCH ENGINE
-# =========================================
+# ==========================================
+# MODÈLE DE POISSON
+# ==========================================
 
-def analyze_match(fixture):
+def calculate_btts(lambda_home, lambda_away):
+    p_home = 1 - math.exp(-lambda_home)
+    p_away = 1 - math.exp(-lambda_away)
+
+    yes = p_home * p_away
+    no = 1 - yes
+
+    return yes, no
+
+
+# ==========================================
+# NOUVEAU MOTEUR BTTS V5
+# ==========================================
+
+def analyze_match_v5(fixture):
 
     teams = fixture.get("teams", {})
     home = teams.get("home", {})
     away = teams.get("away", {})
 
-    if not home.get("id") or not away.get("id"):
+    home_id = home.get("id")
+    away_id = away.get("id")
+
+    if not home_id or not away_id:
         return None
 
-    h = analyze_team(home["id"])
-    a = analyze_team(away["id"])
+    home_history = get_team_history(home_id)
+    away_history = get_team_history(away_id)
 
-    if h is None or a is None:
+    home_data = team_profile(home_history, home_id)
+    away_data = team_profile(away_history, away_id)
+
+    if home_data is None or away_data is None:
         return None
 
-    # Home and away expected goals
-    home_lambda = (
-        h["attack"] * 0.55 +
-        a["defense"] * 0.45
+    h5 = home_data["last5"]
+    h10 = home_data["last10"]
+    a5 = away_data["last5"]
+    a10 = away_data["last10"]
+
+    # Domicile et extérieur avec repli sur les 10 derniers matchs
+    home_venue = home_data["home"] or h10
+    away_venue = away_data["away"] or a10
+
+    # Estimation offensive et défensive
+    lh = (
+        0.60 * home_venue["scored"]
+        + 0.40 * away_venue["conceded"]
     )
 
-    away_lambda = (
-        a["attack"] * 0.55 +
-        h["defense"] * 0.45
+    la = (
+        0.60 * away_venue["scored"]
+        + 0.40 * home_venue["conceded"]
     )
 
-    if len(h["home_data"]) >= 3:
-        home_lambda = (
-            home_lambda * 0.65 +
-            h["home_data"].scored.mean() * 0.35
-        )
-
-    if len(a["away_data"]) >= 3:
-        away_lambda = (
-            away_lambda * 0.65 +
-            a["away_data"].scored.mean() * 0.35
-        )
-
-    home_lambda = max(0.05, min(4, home_lambda))
-    away_lambda = max(0.05, min(4, away_lambda))
-
-    yes, no = probability_btts(
-        home_lambda,
-        away_lambda
+    # Correction par la forme récente
+    lh = 0.75 * lh + 0.25 * (
+        0.60 * h5["scored"] + 0.40 * a5["conceded"]
     )
 
-    historical_yes = (h["btts"] + a["btts"]) / 2
-    recent_yes = (h["recent"] + a["recent"]) / 2
-
-    # Combined statistical estimates
-    yes_probability = (
-        yes * 0.50 +
-        historical_yes * 0.30 +
-        recent_yes * 0.20
+    la = 0.75 * la + 0.25 * (
+        0.60 * a5["scored"] + 0.40 * h5["conceded"]
     )
 
-    no_probability = 1 - yes_probability
+    # Protection des valeurs
+    lh = max(0.05, min(lh, 4.0))
+    la = max(0.05, min(la, 4.0))
 
-    # Risk controls
-    risks = []
+    yes, no = calculate_btts(lh, la)
 
-    if h["matches"] < 10 or a["matches"] < 10:
-        risks.append("Historique incomplet")
+    # Sept filtres BTTS OUI
+    yes_filters = [
+        h10["count"] >= 5 and a10["count"] >= 5,
+        h5["btts"] >= 0.40,
+        a5["btts"] >= 0.40,
+        lh >= 0.80 and la >= 0.80,
+        h10["conceded"] >= 0.70 and a10["conceded"] >= 0.70,
+        h10["total"] >= 2.0 and a10["total"] >= 2.0,
+        yes >= 0.60
+    ]
 
-    if h["scored_rate"] < 0.60:
-        risks.append("Attaque domicile faible")
+    # Sept filtres BTTS NON
+    no_filters = [
+        h10["count"] >= 5 and a10["count"] >= 5,
+        h10["btts"] <= 0.50,
+        a10["btts"] <= 0.50,
+        lh < 1.50 or la < 1.50,
+        h10["scored"] < 1.60 or a10["scored"] < 1.60,
+        no >= 0.65,
+        no >= 0.70
+    ]
 
-    if a["scored_rate"] < 0.60:
-        risks.append("Attaque extérieur faible")
+    yes_score = sum(yes_filters)
+    no_score = sum(no_filters)
 
-    if h["recent"] < 0.40 or a["recent"] < 0.40:
-        risks.append("Tendance BTTS récente faible")
+    prediction = "AUCUN"
 
-    # API prediction is a separate opinion,
-    # not a fabricated BTTS percentage.
-    fixture_id = fixture.get("fixture", {}).get("id")
-    api_prediction = get_api_prediction(fixture_id)
+    if yes >= 0.65 and yes_score >= 6:
+        prediction = "BTTS OUI"
+
+    elif no >= 0.70 and no_score >= 6:
+        prediction = "BTTS NON"
 
     return {
-        "fixture_id": fixture_id,
-        "home": home.get("name"),
-        "away": away.get("name"),
-        "league": fixture.get("league", {}).get("name"),
-        "time": fixture.get("fixture", {}).get("date"),
-        "yes": round(yes_probability * 100, 1),
-        "no": round(no_probability * 100, 1),
-        "poisson": round(yes * 100, 1),
-        "historical": round(historical_yes * 100, 1),
-        "recent": round(recent_yes * 100, 1),
-        "home_lambda": round(home_lambda, 2),
-        "away_lambda": round(away_lambda, 2),
-        "risks": risks,
-        "api_advice": (
-            api_prediction.get("advice", "Non disponible")
-            if api_prediction else "Non disponible"
-        )
+        "home": home.get("name", "Domicile"),
+        "away": away.get("name", "Extérieur"),
+        "home_logo": home.get("logo"),
+        "away_logo": away.get("logo"),
+        "league": fixture.get("league", {}).get("name", ""),
+        "date": fixture.get("fixture", {}).get("date", ""),
+        "yes": round(yes * 100, 1),
+        "no": round(no * 100, 1),
+        "yes_score": yes_score,
+        "no_score": no_score,
+        "prediction": prediction,
+        "lambda_home": round(lh, 2),
+        "lambda_away": round(la, 2),
+        "yes_filters": yes_filters,
+        "no_filters": no_filters
     }
 
 
-# =========================================
-# DAILY ANALYSIS
-# =========================================
+# ==========================================
+# AFFICHAGE AUTOMATIQUE
+# ==========================================
 
-def run_daily_analysis():
+@st.fragment(run_every="60s")
+def automatic_dashboard():
 
-    global team_cache
+    now = datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
 
-    team_cache = {}
+    st.caption(
+        f"Date : {now.strftime('%d/%m/%Y')} | "
+        f"Dernière actualisation : {now.strftime('%H:%M:%S')}"
+    )
 
-    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    try:
+        matches = get_today_matches(today)
 
-    fixtures = get_fixtures(today)
+    except Exception as error:
+        st.error(str(error))
+        return
+
+    st.subheader(f"📅 Matchs du jour : {len(matches)}")
+
+    if not matches:
+        st.info("Aucun match disponible pour aujourd'hui.")
+        return
+
+    # Affichage des matchs et logos
+    upcoming = []
+
+    for match in matches:
+        fixture = match.get("fixture", {})
+        status = fixture.get("status", {}).get("short")
+        home = match.get("teams", {}).get("home", {})
+        away = match.get("teams", {}).get("away", {})
+
+        if status in ["NS", "TBD"]:
+            upcoming.append(match)
+
+        with st.container(border=True):
+            col1, col2, col3 = st.columns([2, 1, 2])
+
+            with col1:
+                if home.get("logo"):
+                    st.image(home["logo"], width=55)
+                st.write(home.get("name", "Domicile"))
+
+            with col2:
+                st.write("VS")
+                st.caption(
+                    fixture.get("date", "")[11:16]
+                    if fixture.get("date") else ""
+                )
+
+            with col3:
+                if away.get("logo"):
+                    st.image(away["logo"], width=55)
+                st.write(away.get("name", "Extérieur"))
+
+    st.divider()
+    st.subheader("🧠 Analyses automatiques BTTS V5")
+
+    candidates = sorted(
+        upcoming,
+        key=lambda x: x.get("fixture", {}).get("date", "")
+    )[:MAX_ANALYSES]
 
     results = []
 
-    # Analyse all available competitions
-    # with a controlled API request budget.
-    candidates = [
-        f for f in fixtures
-        if f.get("fixture", {}).get("status", {}).get("short") == "NS"
-    ][:MAX_FIXTURES]
+    progress = st.progress(0)
 
-    for index, fixture in enumerate(candidates):
-
+    for index, match in enumerate(candidates):
         try:
-            result = analyze_match(fixture)
+            result = analyze_match_v5(match)
 
             if result:
                 results.append(result)
 
         except Exception as error:
-            print("MATCH ERROR:", error)
+            st.warning(f"Une analyse a échoué : {error}")
 
-        time.sleep(0.3)
+        progress.progress((index + 1) / len(candidates))
 
-    # Both BTTS markets are considered.
-    selections = []
+    progress.empty()
 
-    for match in results:
+    if not results:
+        st.warning(
+            "Données historiques insuffisantes. "
+            "Les matchs restent affichés, mais aucune prédiction "
+            "fiable ne peut être produite."
+        )
+        return
 
-        if match["yes"] >= MIN_PROB:
-            selections.append({
-                **match,
-                "market": "BTTS OUI",
-                "probability": match["yes"]
-            })
+    # Résultats individuels
+    for result in results:
+        with st.expander(
+            f"{result['home']} - {result['away']} | "
+            f"{result['prediction']}"
+        ):
+            st.write(f"Compétition : {result['league']}")
+            st.write(f"BTTS OUI : {result['yes']} %")
+            st.write(f"BTTS NON : {result['no']} %")
+            st.write(
+                f"Filtres OUI : {result['yes_score']}/7"
+            )
+            st.write(
+                f"Filtres NON : {result['no_score']}/7"
+            )
+            st.write(
+                f"Buts attendus : {result['lambda_home']} - "
+                f"{result['lambda_away']}"
+            )
 
-        if match["no"] >= MIN_PROB:
-            selections.append({
-                **match,
-                "market": "BTTS NON",
-                "probability": match["no"]
-            })
+            st.write("Filtres OUI :")
+            for i, passed in enumerate(result["yes_filters"], 1):
+                st.write(f"{'✅' if passed else '❌'} Filtre {i}")
 
-    selections.sort(
-        key=lambda x: x["probability"],
+            st.write("Filtres NON :")
+            for i, passed in enumerate(result["no_filters"], 1):
+                st.write(f"{'✅' if passed else '❌'} Filtre {i}")
+
+    # Trois meilleures sélections maximum
+    recommendations = [
+        r for r in results if r["prediction"] != "AUCUN"
+    ]
+
+    recommendations.sort(
+        key=lambda r: (
+            r["yes_score"] if r["prediction"] == "BTTS OUI"
+            else r["no_score"],
+            r["yes"] if r["prediction"] == "BTTS OUI"
+            else r["no"]
+        ),
         reverse=True
     )
 
-    # Do not duplicate the same match.
-    final = []
-    seen = set()
+    st.divider()
+    st.subheader("🏆 TOP 3 BTTS V5")
 
-    for item in selections:
-        if item["fixture_id"] in seen:
-            continue
-
-        seen.add(item["fixture_id"])
-
-        if len(final) == TOP_N:
-            break
-
-        final.append(item)
-
-    return {
-        "date": today,
-        "matches_scanned": len(candidates),
-        "analyzed": len(results),
-        "top5": final
-    }
-
-
-# =========================================
-# AUTOMATIC SCHEDULER
-# =========================================
-
-cache_lock = threading.Lock()
-daily_cache = {
-    "date": None,
-    "data": None,
-    "updated": None
-}
-
-
-def scheduled_analysis():
-
-    now = datetime.now(TZ)
-
-    if now.hour < 7:
-        return
-
-    with cache_lock:
-
-        date = now.strftime("%Y-%m-%d")
-
-        if daily_cache["date"] == date:
-            return
-
-        print("BTTS V4: Daily analysis started")
-
-        data = run_daily_analysis()
-
-        daily_cache["date"] = date
-        daily_cache["data"] = data
-        daily_cache["updated"] = now.isoformat()
-
-        print("BTTS V4: Daily analysis completed")
-
-
-@st.cache_resource
-def start_scheduler():
-
-    scheduler = BackgroundScheduler(
-        timezone=TZ
-    )
-
-    scheduler.add_job(
-        scheduled_analysis,
-        "cron",
-        hour=7,
-        minute=0,
-        id="daily_analysis",
-        replace_existing=True,
-        max_instances=1
-    )
-
-    scheduler.start()
-
-    return scheduler
-
-
-scheduler = start_scheduler()
-
-
-# =========================================
-# DASHBOARD
-# =========================================
-
-st.title("⚽ BTTS V4 ULTRA ENGINE")
-
-st.caption(
-    "Intelligence statistique | Toutes les divisions disponibles"
-)
-
-if not API_KEY:
-    st.error("API_FOOTBALL_KEY absente dans Render.")
-    st.stop()
-
-st.info(
-    "Actualisation quotidienne programmée à 7 h. "
-    "Les analyses sont destinées à être disponibles avant 8 h."
-)
-
-with cache_lock:
-    data = daily_cache["data"]
-    updated = daily_cache["updated"]
-
-if st.button("Actualiser les analyses maintenant"):
-
-    with st.spinner("Analyse des rencontres en cours..."):
-
-        new_data = run_daily_analysis()
-
-        with cache_lock:
-            daily_cache["date"] = new_data["date"]
-            daily_cache["data"] = new_data
-            daily_cache["updated"] = datetime.now(TZ).isoformat()
-
-        data = new_data
-        updated = daily_cache["updated"]
-
-if data is None:
-
-    st.warning(
-        "Les analyses du jour ne sont pas encore disponibles. "
-        "Le moteur attend sa première exécution."
-    )
-
-else:
-
-    st.success(
-        f"Analyse du {data['date']} | "
-        f"{data['analyzed']} matchs analysés"
-    )
-
-    if updated:
-        st.caption(f"Dernière actualisation : {updated}")
-
-    st.subheader("🏆 TOP 5 DU JOUR")
-
-    if not data["top5"]:
-
-        st.warning(
-            "Aucun match ne satisfait les critères de sélection "
-            "à 80 %. Le moteur ne force aucune sélection."
+    if not recommendations:
+        st.info(
+            "Aucune rencontre ne passe les critères. "
+            "Le moteur ne force aucune sélection."
         )
 
-    for rank, match in enumerate(data["top5"], 1):
-
-        with st.container(border=True):
-
-            st.markdown(
-                f"### {rank}. {match['home']} - {match['away']}"
-            )
-
-            st.write(f"Championnat : {match['league']}")
-
-            st.metric(
-                match["market"],
-                f"{match['probability']} %"
-            )
-
-            st.write(
-                f"Poisson : {match['poisson']} % | "
-                f"Historique : {match['historical']} %"
-            )
-
-            st.write(
-                f"Tendance récente : {match['recent']} %"
-            )
-
-            st.write(
-                f"Buts attendus : {match['home_lambda']} - "
-                f"{match['away_lambda']}"
-            )
-
-            st.write(
-                f"Deuxième avis API-Football : "
-                f"{match['api_advice']}"
-            )
-
-            if match["risks"]:
-                st.warning("Risques : " + ", ".join(match["risks"]))
-            else:
-                st.success("Filtres historiques validés")
+    for number, result in enumerate(
+        recommendations[:MAX_RECOMMENDATIONS], 1
+    ):
+        st.success(
+            f"#{number} — {result['home']} vs {result['away']}\n\n"
+            f"Prédiction : {result['prediction']}\n\n"
+            f"BTTS OUI : {result['yes']} % | "
+            f"BTTS NON : {result['no']} %"
+        )
 
     st.caption(
-        "80 % est un seuil de sélection du modèle, "
-        "pas une garantie de résultat."
+        "Les probabilités sont des estimations statistiques, "
+        "jamais des garanties de résultat."
     )
 
-st.divider()
 
-st.write("Matchs récupérés :", data["matches_scanned"] if data else 0)
-st.write("Matchs analysés :", data["analyzed"] if data else 0)
+# ==========================================
+# LANCEMENT
+# ==========================================
+
+automatic_dashboard()
+tj
